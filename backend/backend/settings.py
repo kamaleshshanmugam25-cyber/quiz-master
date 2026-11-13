@@ -1,3 +1,4 @@
+
 """
 Django settings for backend project.
 """
@@ -11,29 +12,45 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 HAS_WHITENOISE = importlib.util.find_spec('whitenoise') is not None
 
 try:
-    from dotenv import load_dotenv  # type: ignore
+    from dotenv import load_dotenv
     load_dotenv(BASE_DIR / '.env')
 except Exception:
     pass
 
 
 def env_bool(name, default=False):
-    return os.getenv(name, str(default)).strip().lower() in {'1', 'true', 'yes', 'on'}
+    return os.getenv(name, str(default)).strip().lower() in {
+        '1', 'true', 'yes', 'on'
+    }
 
 
 def env_list(name, default=''):
-    return [item.strip() for item in os.getenv(name, default).split(',') if item.strip()]
+    return [
+        item.strip()
+        for item in os.getenv(name, default).split(',')
+        if item.strip()
+    ]
 
-# ── Security ──────────────────────────────────────────────────────────────────
+
+# ── Security ──────────────────────────────────────────────────────────────
+
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'dev-insecure-secret-key')
 DEBUG = env_bool('DJANGO_DEBUG', True)
 
 if DEBUG:
-    ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,0.0.0.0,*')
+    ALLOWED_HOSTS = env_list(
+        'DJANGO_ALLOWED_HOSTS',
+        'localhost,127.0.0.1,0.0.0.0,*'
+    )
 else:
-    ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
+    ALLOWED_HOSTS = env_list(
+        'DJANGO_ALLOWED_HOSTS',
+        'localhost,127.0.0.1'
+    )
 
-# ── Installed apps ────────────────────────────────────────────────────────────
+
+# ── Installed Apps ────────────────────────────────────────────────────────
+
 INSTALLED_APPS = [
     'daphne',
     'django.contrib.admin',
@@ -49,45 +66,57 @@ INSTALLED_APPS = [
     'corsheaders',
 ]
 
-# ── ASGI / Channels ───────────────────────────────────────────────────────────
+
+# ── ASGI / Channels / Redis ────────────────────────────────────────────────
+
 ASGI_APPLICATION = 'backend.asgi.application'
 WSGI_APPLICATION = 'backend.wsgi.application'
 
-# InMemoryChannelLayer — works for single-process Daphne (no Redis needed)
-REDIS_URL = os.getenv('REDIS_URL')
-if REDIS_URL:
-    CHANNEL_LAYERS = {
-        'default': {
-            'BACKEND': 'channels_redis.core.RedisChannelLayer',
-            'CONFIG': {'hosts': [REDIS_URL]},
-        }
-    }
-else:
-    CHANNEL_LAYERS = {
-        'default': {
-            'BACKEND': 'channels.layers.InMemoryChannelLayer'
-        }
-    }
+# Memurai is Redis-compatible and runs locally on port 6379.
+# An empty or missing REDIS_URL will use this default.
+REDIS_URL = (
+    os.getenv('REDIS_URL') or 'redis://127.0.0.1:6379/0'
+).strip()
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            'hosts': [REDIS_URL],
+        },
+    }
+}
+
+
+# ── Authentication ────────────────────────────────────────────────────────
+
 AUTH_USER_MODEL = 'quiz.User'
+
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
-# ── Middleware ────────────────────────────────────────────────────────────────
+
+# ── Middleware ────────────────────────────────────────────────────────────
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    # CsrfViewMiddleware intentionally omitted — app uses Token auth, not session auth
+    'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
-if HAS_WHITENOISE:
-    MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
 
-# ── REST Framework ────────────────────────────────────────────────────────────
+if HAS_WHITENOISE:
+    MIDDLEWARE.insert(
+        1,
+        'whitenoise.middleware.WhiteNoiseMiddleware'
+    )
+
+
+# ── Django REST Framework ─────────────────────────────────────────────────
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.TokenAuthentication',
@@ -104,20 +133,36 @@ REST_FRAMEWORK = {
         'anon': os.getenv('DRF_THROTTLE_ANON', '500/day'),
     },
 }
+
 if DEBUG:
     REST_FRAMEWORK['DEFAULT_THROTTLE_CLASSES'] = []
     REST_FRAMEWORK.pop('DEFAULT_THROTTLE_RATES', None)
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-# Allow all origins — frontend served from fixed IP, phones connect from any network
+
+# ── CORS ──────────────────────────────────────────────────────────────────
+
 FRONTEND_ORIGINS = env_list(
     'FRONTEND_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000,http://localhost:8282,http://127.0.0.1:8282'
+    'http://localhost:3000,'
+    'http://127.0.0.1:3000,'
+    'http://localhost:8282,'
+    'http://127.0.0.1:8282'
 )
 
-CORS_ALLOW_ALL_ORIGINS = env_bool('CORS_ALLOW_ALL_ORIGINS', True)
-CORS_ALLOWED_ORIGINS = [] if CORS_ALLOW_ALL_ORIGINS else FRONTEND_ORIGINS
-CORS_ALLOW_CREDENTIALS = env_bool('CORS_ALLOW_CREDENTIALS', True)
+CORS_ALLOW_ALL_ORIGINS = env_bool(
+    'CORS_ALLOW_ALL_ORIGINS',
+    True
+)
+
+CORS_ALLOWED_ORIGINS = (
+    [] if CORS_ALLOW_ALL_ORIGINS else FRONTEND_ORIGINS
+)
+
+CORS_ALLOW_CREDENTIALS = env_bool(
+    'CORS_ALLOW_CREDENTIALS',
+    True
+)
+
 CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',
@@ -130,7 +175,28 @@ CORS_ALLOW_HEADERS = [
     'x-requested-with',
 ]
 
-# ── URLs / Templates ──────────────────────────────────────────────────────────
+
+# ── CSRF Trusted Origins ──────────────────────────────────────────────────
+
+CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS')
+
+if DEBUG:
+    CSRF_TRUSTED_ORIGINS += FRONTEND_ORIGINS
+
+    CSRF_TRUSTED_ORIGINS += [
+        'http://localhost:8080',
+        'http://127.0.0.1:8080',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        f'http://{os.getenv("HOST_IP", "localhost")}:3000',
+        f'http://{os.getenv("HOST_IP", "localhost")}:8282',
+    ]
+
+CSRF_TRUSTED_ORIGINS = sorted(set(CSRF_TRUSTED_ORIGINS))
+
+
+# ── URLs / Templates ──────────────────────────────────────────────────────
+
 ROOT_URLCONF = 'backend.urls'
 
 TEMPLATES = [
@@ -148,8 +214,11 @@ TEMPLATES = [
     },
 ]
 
-# ── Database ──────────────────────────────────────────────────────────────────
+
+# ── Database ──────────────────────────────────────────────────────────────
+
 MONGO_URI = os.getenv('MONGO_URI') or os.getenv('DATABASE_URL')
+
 if MONGO_URI:
     DATABASES = {
         'default': {
@@ -169,106 +238,164 @@ else:
         }
     }
 
-CONN_MAX_AGE = int(os.getenv('DB_CONN_MAX_AGE', '0' if MONGO_URI else '300'))
+CONN_MAX_AGE = int(
+    os.getenv('DB_CONN_MAX_AGE', '0' if MONGO_URI else '300')
+)
 
-# ── Password validation ───────────────────────────────────────────────────────
+
+# ── Password Validation ───────────────────────────────────────────────────
+
 AUTH_PASSWORD_VALIDATORS = [
-    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {
+        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'
+    },
     {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-        'OPTIONS': {'min_length': int(os.getenv('PASSWORD_MIN_LENGTH', '6'))}
+        'OPTIONS': {
+            'min_length': int(os.getenv('PASSWORD_MIN_LENGTH', '6'))
+        }
     },
-    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+    {
+        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'
+    },
+    {
+        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'
+    },
 ]
 
-# ── Internationalisation ──────────────────────────────────────────────────────
+
+# ── Internationalisation ──────────────────────────────────────────────────
+
 LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'UTC'
+
 USE_I18N = True
 USE_TZ = True
 
-# ── Static files ──────────────────────────────────────────────────────────────
+
+# ── Static Files ──────────────────────────────────────────────────────────
+
 STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-if HAS_WHITENOISE:
-    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
-# ── Media files ───────────────────────────────────────────────────────────────
+if HAS_WHITENOISE:
+    STATICFILES_STORAGE = (
+        'whitenoise.storage.CompressedManifestStaticFilesStorage'
+    )
+
+
+# ── Media Files ───────────────────────────────────────────────────────────
+
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'quiz_media')
 
+
+# ── Default Primary Key ───────────────────────────────────────────────────
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# ── Security headers ──────────────────────────────────────────────────────────
+
+# ── Security Headers ──────────────────────────────────────────────────────
+
 SESSION_COOKIE_SECURE = env_bool('SESSION_COOKIE_SECURE', False)
 CSRF_COOKIE_SECURE = env_bool('CSRF_COOKIE_SECURE', False)
+
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = False
-SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax')
-CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax')
+
+SESSION_COOKIE_SAMESITE = os.getenv(
+    'SESSION_COOKIE_SAMESITE',
+    'Lax'
+)
+
+CSRF_COOKIE_SAMESITE = os.getenv(
+    'CSRF_COOKIE_SAMESITE',
+    'Lax'
+)
+
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
-# Only enable HSTS / SSL redirect when explicitly set via env — avoids breaking HTTP EC2
-SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '0'))
-SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool('SECURE_HSTS_INCLUDE_SUBDOMAINS', False)
-SECURE_HSTS_PRELOAD = env_bool('SECURE_HSTS_PRELOAD', False)
-SECURE_SSL_REDIRECT = env_bool('SECURE_SSL_REDIRECT', False)
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-USE_X_FORWARDED_HOST = env_bool('USE_X_FORWARDED_HOST', True)
 
-# CSRF trusted origins (add your domain/IP here for production)
-CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS')
-if DEBUG:
-    CSRF_TRUSTED_ORIGINS += FRONTEND_ORIGINS + [
-        'http://localhost:3000',
-        'http://127.0.0.1:3000',
-        f'http://{os.getenv("HOST_IP", "localhost")}:3000',
-        f'http://{os.getenv("HOST_IP", "localhost")}:8282',
-    ]
-CSRF_TRUSTED_ORIGINS = sorted(set(CSRF_TRUSTED_ORIGINS))
+SECURE_HSTS_SECONDS = int(
+    os.getenv('SECURE_HSTS_SECONDS', '0')
+)
 
-X_FRAME_OPTIONS = 'DENY'
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(
+    'SECURE_HSTS_INCLUDE_SUBDOMAINS',
+    False
+)
 
-# ── Session ───────────────────────────────────────────────────────────────────
-SESSION_COOKIE_AGE = int(os.getenv('SESSION_COOKIE_AGE', str(int(timedelta(hours=8).total_seconds()))))
-SESSION_EXPIRE_AT_BROWSER_CLOSE = env_bool('SESSION_EXPIRE_AT_BROWSER_CLOSE', False)
+SECURE_HSTS_PRELOAD = env_bool(
+    'SECURE_HSTS_PRELOAD',
+    False
+)
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+SECURE_SSL_REDIRECT = env_bool(
+    'SECURE_SSL_REDIRECT',
+    False
+)
+
+SECURE_PROXY_SSL_HEADER = (
+    'HTTP_X_FORWARDED_PROTO',
+    'https'
+)
+
+USE_X_FORWARDED_HOST = env_bool(
+    'USE_X_FORWARDED_HOST',
+    True
+)
+
+
+# ── Session ───────────────────────────────────────────────────────────────
+
+SESSION_COOKIE_AGE = int(
+    os.getenv(
+        'SESSION_COOKIE_AGE',
+        str(int(timedelta(hours=8).total_seconds()))
+    )
+)
+
+SESSION_EXPIRE_AT_BROWSER_CLOSE = env_bool(
+    'SESSION_EXPIRE_AT_BROWSER_CLOSE',
+    False
+)
+
+
+# ── Logging ───────────────────────────────────────────────────────────────
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
+
     'formatters': {
         'verbose': {
             'format': '[{levelname}] {asctime} {name}:{lineno} {message}',
             'style': '{',
         },
     },
+
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
             'formatter': 'verbose',
         },
     },
+
     'loggers': {
-        'django.security': {'handlers': ['console'], 'level': 'WARNING'},
-        'quiz': {'handlers': ['console'], 'level': os.getenv('QUIZ_LOG_LEVEL', 'INFO')},
-        'daphne': {'handlers': ['console'], 'level': 'INFO'},
+        'django.security': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+        },
+        'quiz': {
+            'handlers': ['console'],
+            'level': os.getenv('QUIZ_LOG_LEVEL', 'INFO'),
+        },
+        'daphne': {
+            'handlers': ['console'],
+            'level': 'INFO',
+        },
     },
 }
-
-
-# ── SQLite High-Concurrency Performance Tuning (WAL Mode) ─────────────────────
-from django.db.backends.signals import connection_created
-from django.dispatch import receiver
-
-@receiver(connection_created)
-def configure_sqlite_performance(sender, connection, **kwargs):
-    if connection.vendor == 'sqlite':
-        cursor = connection.cursor()
-        cursor.execute('PRAGMA journal_mode = WAL;')
-        cursor.execute('PRAGMA synchronous = NORMAL;')
-        cursor.execute('PRAGMA busy_timeout = 10000;')
-        cursor.execute('PRAGMA cache_size = -64000;')
-        cursor.execute('PRAGMA mmap_size = 268435456;')
-        cursor.execute('PRAGMA temp_store = MEMORY;')

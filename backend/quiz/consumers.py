@@ -6,6 +6,35 @@ import random
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from django.utils import timezone
+import redis.asyncio as aioredis
+from django.conf import settings
+
+_redis_client = None
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None:
+        redis_url = getattr(settings, 'REDIS_URL', 'redis://127.0.0.1:6379/0')
+        _redis_client = aioredis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2.0,
+            socket_timeout=2.0,
+            retry_on_timeout=True
+        )
+    return _redis_client
+
+
+def _sanitize_question_for_player(q):
+    if not q:
+        return None
+    q_copy = dict(q)
+    if "choices" in q_copy:
+        q_copy["choices"] = [
+            {k: v for k, v in dict(c).items() if k != "is_correct"}
+            for c in q_copy["choices"]
+        ]
+    return q_copy
 
 from .models import (
     QuizSession,
@@ -143,8 +172,8 @@ class QuizConsumer(AsyncWebsocketConsumer):
 
             rs["clients"].discard(self.channel_name)
 
-            # CLEANUP
-            if not rs["clients"]:
+            # CLEANUP: Only evict from process memory if session is explicitly ended
+            if not rs["clients"] and rs.get("status") == "ended":
 
                 close_task = rs.get("close_task")
 
@@ -340,6 +369,17 @@ class QuizConsumer(AsyncWebsocketConsumer):
 
         self._schedule_lobby_update(rs)
 
+        # Synchronize participants globally via Redis
+        global_count = len(rs["usernames"])
+        try:
+            r = _get_redis()
+            part_key = f"quiz:{self.session_code}:participants"
+            await r.sadd(part_key, username)
+            await r.expire(part_key, 7200)
+            global_count = await r.scard(part_key)
+        except Exception:
+            pass
+
         # lightweight count
         await self.channel_layer.group_send(
             self.group_name,
@@ -347,7 +387,7 @@ class QuizConsumer(AsyncWebsocketConsumer):
                 "type": "send_json",
                 "payload": {
                     "type": "participant_count",
-                    "count": len(rs["usernames"])
+                    "count": global_count
                 }
             }
         )
@@ -393,14 +433,34 @@ class QuizConsumer(AsyncWebsocketConsumer):
         rs["last_counts"] = counts
         await self._set_session_state("question", question_id=q.get("id"), question_index=data.get("question_index"), duration=expires_in)
 
-        # BROADCAST
+        # Synchronize question & zero counts in Redis
+        try:
+            r = _get_redis()
+            counts_key = f"quiz:{self.session_code}:counts"
+            await r.delete(counts_key)
+            if counts:
+                await r.hset(counts_key, mapping={k: 0 for k in counts.keys()})
+                await r.expire(counts_key, 7200)
+            state_key = f"quiz:{self.session_code}:state"
+            await r.hset(state_key, mapping={
+                "status": "question",
+                "question_json": json.dumps(q),
+                "expires_in": str(expires_in),
+                "duration": str(expires_in),
+                "question_start": str(int(time.time() * 1000)),
+            })
+            await r.expire(state_key, 7200)
+        except Exception as e:
+            print(f"[Redis sync on broadcast]: {e}")
+
+        # BROADCAST: Sanitize choices for players so is_correct is not leaked
         await self.channel_layer.group_send(
             self.group_name,
             {
                 "type": "send_json",
                 "payload": {
                     "type": "question",
-                    "question": q,
+                    "question": _sanitize_question_for_player(q),
                     "expires_in": expires_in,
                     "duration": expires_in,
                 }
@@ -421,7 +481,7 @@ class QuizConsumer(AsyncWebsocketConsumer):
     async def _handle_answer(self, data):
 
         selected_choice_id = str(
-            data.get("selected_choice_id", "")
+            data.get("selected_choice_id") or data.get("choice_id") or ""
         )
 
         username = data.get("username", "")
@@ -432,11 +492,34 @@ class QuizConsumer(AsyncWebsocketConsumer):
 
         rs = runtime_sessions.get(self.session_code)
 
-        if not rs or not rs["current_q"] or rs.get("status") != "question":
+        if not rs or not rs.get("current_q") or rs.get("status") != "question":
+            # Hydrate from Redis shared state if this worker process was cold
+            try:
+                r = _get_redis()
+                st = await r.hgetall(f"quiz:{self.session_code}:state")
+                if st and st.get("status") == "question":
+                    if not rs:
+                        rs = _init_session(self.session_code)
+                    rs["status"] = "question"
+                    if "question_json" in st:
+                        rs["current_q"] = json.loads(st["question_json"])
+            except Exception:
+                pass
+
+        if not rs or not rs.get("current_q") or rs.get("status") != "question":
             return
 
-        if selected_choice_id in rs["counts"]:
-            rs["counts"][selected_choice_id] += 1
+        # Atomic cross-worker vote recording via Redis
+        choice_key_str = str(selected_choice_id)
+        try:
+            r = _get_redis()
+            counts_key = f"quiz:{self.session_code}:counts"
+            await r.hincrby(counts_key, choice_key_str, 1)
+            raw_counts = await r.hgetall(counts_key)
+            rs["counts"] = {k: int(v) for k, v in raw_counts.items()}
+        except Exception as e:
+            if selected_choice_id in rs["counts"]:
+                rs["counts"][selected_choice_id] += 1
 
         # background db save
         asyncio.create_task(
@@ -568,8 +651,20 @@ class QuizConsumer(AsyncWebsocketConsumer):
         if not rs:
             return
 
+        try:
+            r = _get_redis()
+            counts_key = f"quiz:{self.session_code}:counts"
+            raw_counts = await r.hgetall(counts_key)
+            if raw_counts:
+                counts = {k: int(v) for k, v in raw_counts.items()}
+                rs["counts"] = counts
+            else:
+                counts = dict(rs.get("last_counts") or rs.get("counts") or {})
+            await r.hset(f"quiz:{self.session_code}:state", "status", "answer_reveal")
+        except Exception:
+            counts = dict(rs.get("last_counts") or rs.get("counts") or {})
+
         q = rs.get("last_q") or rs.get("current_q")
-        counts = dict(rs.get("last_counts") or rs.get("counts") or {})
         rs["status"] = "answer_reveal"
         rs["current_q"] = q
         rs["counts"] = counts
@@ -595,8 +690,20 @@ class QuizConsumer(AsyncWebsocketConsumer):
         if not rs:
             return
 
+        try:
+            r = _get_redis()
+            counts_key = f"quiz:{self.session_code}:counts"
+            raw_counts = await r.hgetall(counts_key)
+            if raw_counts:
+                counts = {k: int(v) for k, v in raw_counts.items()}
+                rs["counts"] = counts
+            else:
+                counts = dict(rs.get("last_counts") or rs.get("counts") or {})
+            await r.hset(f"quiz:{self.session_code}:state", "status", "answer_reveal")
+        except Exception:
+            counts = dict(rs.get("last_counts") or rs.get("counts") or {})
+
         q = rs.get("last_q") or rs.get("current_q")
-        counts = dict(rs.get("last_counts") or rs.get("counts") or {})
         rs["status"] = "leaderboard"
         rs["current_q"] = q
         rs["counts"] = counts
@@ -811,7 +918,18 @@ class QuizConsumer(AsyncWebsocketConsumer):
             if not rs:
                 return
 
-            counts = dict(rs["counts"])
+            try:
+                r = _get_redis()
+                counts_key = f"quiz:{session_code}:counts"
+                raw_counts = await r.hgetall(counts_key)
+                if raw_counts:
+                    counts = {k: int(v) for k, v in raw_counts.items()}
+                    rs["counts"] = counts
+                else:
+                    counts = dict(rs.get("counts", {}))
+                await r.hset(f"quiz:{session_code}:state", "status", "closed")
+            except Exception:
+                counts = dict(rs.get("counts", {}))
 
             await self.channel_layer.group_send(
                 f"quiz_{session_code}",
@@ -852,11 +970,32 @@ class QuizConsumer(AsyncWebsocketConsumer):
         if not rs:
             return
 
+        # Hydrate from Redis shared state if available
+        try:
+            r = _get_redis()
+            st = await r.hgetall(f"quiz:{self.session_code}:state")
+            if st:
+                rs["status"] = st.get("status", rs.get("status", "waiting"))
+                if "question_json" in st:
+                    rs["current_q"] = json.loads(st["question_json"])
+                if "expires_in" in st:
+                    rs["duration"] = int(st["expires_in"])
+                if "question_start" in st and st["question_start"]:
+                    rs["question_start"] = int(st["question_start"])
+            raw_counts = await r.hgetall(f"quiz:{self.session_code}:counts")
+            if raw_counts:
+                rs["counts"] = {k: int(v) for k, v in raw_counts.items()}
+        except Exception:
+            pass
+
+        status_val = rs.get("status", "waiting")
+        counts_val = rs.get("counts") or rs.get("last_counts") or {}
+
         payload = {
             "type": "current_state" if legacy else "sync_state",
-            "state": rs.get("status", "waiting"),
-            "status": rs.get("status", "waiting"),
-            "counts": rs.get("counts") or rs.get("last_counts") or {},
+            "state": status_val,
+            "status": status_val,
+            "counts": counts_val,
             "question_index": rs.get("question_index", 0),
             "current_question_index": rs.get("question_index", 0),
             "session_active": rs.get("active", False),
@@ -865,14 +1004,18 @@ class QuizConsumer(AsyncWebsocketConsumer):
         current_q = rs.get("current_q")
         if current_q:
             elapsed_sec = 0
-            if rs["question_start"]:
+            if rs.get("question_start"):
                 elapsed_sec = (int(time.time() * 1000) - rs["question_start"]) / 1000
-            remaining = max(1, int(rs["duration"] - elapsed_sec))
+            remaining = max(1, int(rs.get("duration", 20) - elapsed_sec))
+
+            # Security: unrevealed questions sent to players must NOT leak is_correct
+            safe_q = current_q if (self.is_host or status_val in ("answer_reveal", "leaderboard", "closed")) else _sanitize_question_for_player(current_q)
+
             payload.update({
-                "status": rs.get("status", "question"),
-                "question": current_q,
+                "status": status_val if status_val != "waiting" else "question",
+                "question": safe_q,
                 "expires_in": remaining,
-                "duration": rs["duration"],
+                "duration": rs.get("duration", 20),
                 "timer_remaining": remaining,
                 "answered": await self._has_answered(username, current_q.get("id")),
             })
@@ -897,7 +1040,17 @@ class QuizConsumer(AsyncWebsocketConsumer):
 
         await asyncio.sleep(GRAPH_DEBOUNCE_SEC)
 
-        counts = dict(rs["counts"])
+        try:
+            r = _get_redis()
+            counts_key = f"quiz:{self.session_code}:counts"
+            raw_counts = await r.hgetall(counts_key)
+            if raw_counts:
+                counts = {k: int(v) for k, v in raw_counts.items()}
+                rs["counts"] = counts
+            else:
+                counts = dict(rs.get("counts", {}))
+        except Exception:
+            counts = dict(rs.get("counts", {}))
 
         await self.channel_layer.group_send(
             self.group_name,
@@ -1025,6 +1178,25 @@ class QuizConsumer(AsyncWebsocketConsumer):
         payload = event.get("payload")
 
         if payload:
+            ptype = payload.get("type")
+            rs = runtime_sessions.get(self.session_code)
+            if rs:
+                if ptype == "question":
+                    rs["status"] = "question"
+                    rs["current_q"] = payload.get("question")
+                    rs["duration"] = payload.get("duration", 20)
+                elif ptype == "correct_revealed":
+                    rs["status"] = "answer_reveal"
+                    if "counts" in payload:
+                        rs["counts"] = payload["counts"]
+                elif ptype == "question_closed":
+                    rs["status"] = "closed"
+                    if "counts" in payload:
+                        rs["counts"] = payload["counts"]
+                elif ptype in ("quiz_ended", "session_ended"):
+                    rs["status"] = "ended"
+                    rs["active"] = False
+
             await self.send(
                 text_data=json.dumps(payload)
             )

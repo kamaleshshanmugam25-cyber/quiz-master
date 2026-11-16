@@ -48,6 +48,28 @@ class QuizSetSerializer(serializers.ModelSerializer):
         return instance
 
 
+class PlayerChoiceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Choice
+        fields = ['id', 'text', 'image']
+
+
+class PlayerQuestionSerializer(serializers.ModelSerializer):
+    choices = PlayerChoiceSerializer(many=True)
+
+    class Meta:
+        model = Question
+        fields = ['id', 'text', 'timer_seconds', 'order', 'choices', 'image']
+
+
+class PlayerQuizSetSerializer(serializers.ModelSerializer):
+    questions = PlayerQuestionSerializer(many=True)
+
+    class Meta:
+        model = QuizSet
+        fields = ['id', 'title', 'questions']
+
+
 class SessionQuizSetSerializer(serializers.ModelSerializer):
     quiz_set = QuizSetSerializer(read_only=True)
     # Use PrimaryKeyRelatedField for write operations (correct FK handling)
@@ -110,6 +132,30 @@ class QuizSessionSerializer(serializers.ModelSerializer):
     quiz_sets = SessionQuizSetSerializer(many=True, read_only=True)
     participants = ParticipantSerializer(many=True, read_only=True)
     current_quiz_set = QuizSetSerializer(read_only=True)
+
+    class Meta:
+        model = QuizSession
+        fields = [
+            'id', 'code', 'host', 'created_at', 'started', 'finished',
+            'current_quiz_set', 'current_question_index', 'state',
+            'current_question', 'timer_duration_seconds', 'session_active',
+            'quiz_sets', 'participants',
+        ]
+
+
+
+class PlayerSessionQuizSetSerializer(serializers.ModelSerializer):
+    quiz_set = PlayerQuizSetSerializer(read_only=True)
+
+    class Meta:
+        model = SessionQuizSet
+        fields = ['id', 'quiz_set', 'order', 'completed', 'added_at']
+
+
+class PlayerQuizSessionSerializer(serializers.ModelSerializer):
+    quiz_sets = PlayerSessionQuizSetSerializer(many=True, read_only=True)
+    participants = ParticipantSerializer(many=True, read_only=True)
+    current_quiz_set = PlayerQuizSetSerializer(read_only=True)
 
     class Meta:
         model = QuizSession

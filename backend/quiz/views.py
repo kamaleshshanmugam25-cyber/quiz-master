@@ -37,7 +37,7 @@ from .consumers import runtime_sessions, _init_session
 from .models import QuizSet, QuizSession, SessionQuizSet, Participant, Question, Choice
 from .serializers import (
     QuizSetSerializer, QuizSessionSerializer, SessionQuizSetSerializer,
-    ParticipantSerializer, QuestionSerializer,
+    ParticipantSerializer, QuestionSerializer, PlayerQuizSessionSerializer,
 )
 
 User = get_user_model()
@@ -292,7 +292,16 @@ def session_quiz(request, code):
         request.session.modified = True
     except Exception:
         pass
-    serializer = QuizSessionSerializer(session)
+
+    # Security Fix: Only authenticated host receives correct answers upfront.
+    # Unauthenticated visitors & players receive PlayerQuizSessionSerializer (no is_correct).
+    is_host = bool(
+        request.user.is_authenticated and session.host == request.user
+    )
+    if is_host:
+        serializer = QuizSessionSerializer(session)
+    else:
+        serializer = PlayerQuizSessionSerializer(session)
     return Response(serializer.data)
 
 

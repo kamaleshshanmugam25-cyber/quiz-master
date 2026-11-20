@@ -17,17 +17,17 @@ class QuestionSerializer(serializers.ModelSerializer):
 
 
 class QuizSetSerializer(serializers.ModelSerializer):
-    questions = QuestionSerializer(many=True)
+    questions = QuestionSerializer(many=True, required=False)
 
     class Meta:
         model = QuizSet
         fields = ['id', 'title', 'questions']
 
     def create(self, validated_data):
-        questions_data = validated_data.pop('questions')
+        questions_data = validated_data.pop('questions', [])
         quizset = super().create(validated_data)
         for q_data in questions_data:
-            choices_data = q_data.pop('choices')
+            choices_data = q_data.pop('choices', [])
             question = Question.objects.create(quiz=quizset, **q_data)
             for c_data in choices_data:
                 Choice.objects.create(question=question, **c_data)

@@ -40,7 +40,7 @@ DEBUG = env_bool('DJANGO_DEBUG', True)
 if DEBUG:
     ALLOWED_HOSTS = env_list(
         'DJANGO_ALLOWED_HOSTS',
-        'localhost,127.0.0.1,0.0.0.0,*'
+        'localhost,127.0.0.1,0.0.0.0'
     )
 else:
     ALLOWED_HOSTS = env_list(
@@ -235,6 +235,9 @@ else:
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+            'OPTIONS': {
+                'timeout': 30.0,
+            },
         }
     }
 

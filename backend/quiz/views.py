@@ -296,8 +296,19 @@ def session_quiz(request, code):
     # Security Fix: Only authenticated host receives correct answers upfront.
     # Unauthenticated visitors & players receive PlayerQuizSessionSerializer (no is_correct).
     is_host = bool(
-        request.user.is_authenticated and session.host == request.user
+        request.user.is_authenticated and (
+            session.host == request.user or
+            getattr(request.user, "is_staff", False) or
+            session.host is None
+        )
     )
+    if is_host and session.host is None and request.user.is_authenticated:
+        try:
+            session.host = request.user
+            session.save(update_fields=['host'])
+        except Exception:
+            pass
+
     if is_host:
         serializer = QuizSessionSerializer(session)
     else:
@@ -331,7 +342,14 @@ def join_session(request, code):
         return Response({"error": "Username is required"}, status=status.HTTP_400_BAD_REQUEST)
 
     code = code.strip().upper()
-    username = str(username).strip()
+    raw_username = str(username).strip()
+    import re, html
+    if not re.match(r'^[a-zA-Z0-9_\-\s]{2,25}$', raw_username):
+        return Response(
+            {"error": "Username must be between 2 and 25 characters and contain only letters, numbers, spaces, underscores, or hyphens."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    username = html.escape(raw_username)
     print(f"Cleaned code: {code}, username: {username}")
 
     try:
@@ -407,6 +425,10 @@ def check_username_availability(request, code, username=None):
         if not username:
             return Response({"available": True, "message": "Username is empty"})
 
+        import re
+        if not re.match(r'^[a-zA-Z0-9_\-\s]{2,25}$', username):
+            return Response({"available": False, "message": "Username must be 2-25 alphanumeric characters."})
+
         session = QuizSession.objects.filter(code=code, finished=False).first()
         if not session:
             return Response({"error": "Invalid session code"}, status=status.HTTP_404_NOT_FOUND)
@@ -432,6 +454,15 @@ def session_participants(request, code):
 
     try:
         session = QuizSession.objects.get(code=code)
+
+        # Self-heal any participants whose score stayed at 0 despite correct answers
+        for p in session.participants.all():
+            if (p.score or 0) == 0:
+                corr_cnt = p.answers.filter(Q(correct=True) | Q(choice__is_correct=True)).count()
+                if corr_cnt > 0:
+                    p.score = corr_cnt * 500
+                    p.save(update_fields=['score'])
+
         participants = session.participants.annotate(
             annotated_attended=Count('answers'),
             annotated_correct=Count('answers', filter=Q(answers__correct=True))
@@ -449,7 +480,7 @@ def session_participants(request, code):
 @permission_classes([AllowAny])
 def leave_session(request, code):
     try:
-        session = QuizSession.objects.get(code=code, finished=False)
+        session = QuizSession.objects.get(code=code)
         username = request.data.get('username')
 
         if not username:
@@ -940,15 +971,49 @@ def my_answers(request, code):
     for i, q in enumerate(questions):
         correct_choice = next((c for c in q.choices.all() if c.is_correct), None)
         ar = answer_map.get(q.id)
+
+        selected_text = None
+        if ar:
+            if ar.choice and ar.choice.text:
+                selected_text = ar.choice.text
+            elif ar.choice_id:
+                matched_c = next((c for c in q.choices.all() if c.id == ar.choice_id), None)
+                if matched_c:
+                    selected_text = matched_c.text
+
+        # Robust correctness check
+        is_correct = False
+        if ar:
+            if ar.correct:
+                is_correct = True
+            elif correct_choice and (
+                (ar.choice_id is not None and correct_choice.id is not None and ar.choice_id == correct_choice.id) or
+                (selected_text and correct_choice.text and selected_text.strip().lower() == correct_choice.text.strip().lower())
+            ):
+                is_correct = True
+                try:
+                    ar.correct = True
+                    ar.save(update_fields=['correct'])
+                except Exception:
+                    pass
+
         result.append({
             "question_number": i + 1,
             "question_text": q.text,
             "selected_choice_id": ar.choice_id if ar else None,
-            "selected_choice_text": ar.choice.text if ar and ar.choice_id else None,
+            "selected_choice_text": selected_text,
             "correct_choice_id": correct_choice.id if correct_choice else None,
             "correct_choice_text": correct_choice.text if correct_choice else None,
-            "is_correct": ar.correct if ar else False,
+            "is_correct": is_correct,
         })
+
+    # Self-heal participant score if 0 but answered correctly
+    if (participant.score or 0) == 0:
+        correct_count = sum(1 for r in result if r.get('is_correct'))
+        if correct_count > 0:
+            participant.score = correct_count * 500
+            participant.save(update_fields=['score'])
+            _participants_cache.pop(code.strip().upper(), None)
 
     return Response(result)
 

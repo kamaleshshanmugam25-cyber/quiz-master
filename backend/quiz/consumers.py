@@ -222,9 +222,9 @@ class QuizConsumer(AsyncWebsocketConsumer):
             await self._handle_answer(data)
 
         # ==========================================
-        # LEAVE
+        # LEAVE / KICK / REMOVE
         # ==========================================
-        elif action == "leave":
+        elif action in ("leave", "kick", "remove_participant"):
             await self._handle_leave(data)
 
         # ==========================================
@@ -243,9 +243,9 @@ class QuizConsumer(AsyncWebsocketConsumer):
             await self._next_question()
 
         # ==========================================
-        # EMOJI
+        # EMOJI / REACTIONS
         # ==========================================
-        elif action == "emoji_reaction":
+        elif action in ("emoji_reaction", "reaction", "emoji"):
             await self._handle_emoji(data)
 
         # ==========================================
@@ -301,7 +301,19 @@ class QuizConsumer(AsyncWebsocketConsumer):
         if not rs:
             return
 
-        is_valid = True if is_host else await self._validate_participant(username)
+        if is_host:
+            token = data.get("token") or self.scope.get("cookies", {}).get("token")
+            is_valid_host = await self._verify_host_token(token)
+            if not is_valid_host:
+                await self.send(text_data=json.dumps({
+                    "type": "join_denied",
+                    "message": "Host authorization failed: valid authentication token required."
+                }))
+                await self.close(code=4003)
+                return
+            is_valid = True
+        else:
+            is_valid = await self._validate_participant(username)
 
         if not is_valid:
 
@@ -463,6 +475,8 @@ class QuizConsumer(AsyncWebsocketConsumer):
                     "question": _sanitize_question_for_player(q),
                     "expires_in": expires_in,
                     "duration": expires_in,
+                    "question_index": data.get("question_index", 0),
+                    "total_questions": data.get("total_questions", 0),
                 }
             }
         )
@@ -484,7 +498,15 @@ class QuizConsumer(AsyncWebsocketConsumer):
             data.get("selected_choice_id") or data.get("choice_id") or ""
         )
 
-        username = data.get("username", "")
+        # Enforce socket-bound participant identity to prevent player impersonation (BUG-04)
+        if not getattr(self, "username", None):
+            await self.send(text_data=json.dumps({
+                "type": "error",
+                "message": "Unauthenticated connection cannot submit answers."
+            }))
+            return
+
+        username = self.username
 
         rt = int(
             data.get("response_time_ms", 0)
@@ -509,15 +531,32 @@ class QuizConsumer(AsyncWebsocketConsumer):
         if not rs or not rs.get("current_q") or rs.get("status") != "question":
             return
 
-        # Atomic cross-worker vote recording via Redis
+        # Atomic cross-worker vote deduplication via Redis (BUG-05)
+        qid = str(rs["current_q"].get("id", ""))
         choice_key_str = str(selected_choice_id)
         try:
             r = _get_redis()
+            voted_key = f"quiz:{self.session_code}:voted:{qid}"
+            is_new_vote = await r.sadd(voted_key, username)
+            if not is_new_vote:
+                await self.send(text_data=json.dumps({
+                    "type": "error",
+                    "message": "Answer already submitted for this question."
+                }))
+                return
+
             counts_key = f"quiz:{self.session_code}:counts"
             await r.hincrby(counts_key, choice_key_str, 1)
             raw_counts = await r.hgetall(counts_key)
             rs["counts"] = {k: int(v) for k, v in raw_counts.items()}
         except Exception as e:
+            has_already_voted = await self._has_answered(username, qid)
+            if has_already_voted:
+                await self.send(text_data=json.dumps({
+                    "type": "error",
+                    "message": "Answer already submitted for this question."
+                }))
+                return
             if selected_choice_id in rs["counts"]:
                 rs["counts"][selected_choice_id] += 1
 
@@ -581,12 +620,10 @@ class QuizConsumer(AsyncWebsocketConsumer):
     # EMOJI
     # =====================================================
     async def _handle_emoji(self, data):
-
         emoji = data.get("emoji")
-        username = data.get("username")
+        username = data.get("username") or getattr(self, "username", None) or "Player"
 
-        if emoji and username:
-
+        if emoji:
             await self.channel_layer.group_send(
                 self.group_name,
                 {
@@ -594,7 +631,7 @@ class QuizConsumer(AsyncWebsocketConsumer):
                     "payload": {
                         "type": "emoji_reaction",
                         "emoji": emoji,
-                        "username": username,
+                        "username": str(username),
                         "timestamp": int(time.time() * 1000)
                     }
                 }
@@ -854,6 +891,11 @@ class QuizConsumer(AsyncWebsocketConsumer):
             rs["counts"] = {}
             rs["question_start"] = None
         await self._set_session_state("ended", clear_question=True)
+        try:
+            r = _get_redis()
+            await r.hset(f"quiz:{self.session_code}:state", mapping={"status": "ended", "active": "0", "current_q": ""})
+        except Exception:
+            pass
 
         await self.channel_layer.group_send(
             self.group_name,
@@ -1350,6 +1392,23 @@ class QuizConsumer(AsyncWebsocketConsumer):
             pass
 
     @sync_to_async
+    def _verify_host_token(self, token_key):
+        if not token_key:
+            return False
+        try:
+            from rest_framework.authtoken.models import Token
+            from quiz.models import QuizSession
+            token_str = str(token_key).strip()
+            if token_str.startswith("Token "):
+                token_str = token_str[6:].strip()
+            token_obj = Token.objects.select_related('user').get(key=token_str)
+            session = QuizSession.objects.select_related('host').get(code=self.session_code)
+            user = token_obj.user
+            return session.host == user or user.is_staff or user.is_superuser
+        except Exception:
+            return False
+
+    @sync_to_async
     def _has_answered(self, username, question_id):
         if not username or not question_id:
             return False
@@ -1418,12 +1477,49 @@ class QuizConsumer(AsyncWebsocketConsumer):
         question
     ):
         try:
-            # Fast in-memory check for correctness from current question cache
-            is_correct = False
-            for c in (question.get("choices") or []):
-                if str(c.get("id")) == str(selected_choice_id):
-                    is_correct = bool(c.get("is_correct"))
-                    break
+            if not question or not selected_choice_id:
+                return None
+
+            try:
+                c_id = int(selected_choice_id)
+            except (ValueError, TypeError):
+                c_id = None
+
+            q_id = question.get("id") if isinstance(question, dict) else getattr(question, "id", None)
+            if q_id is None:
+                return None
+
+            choice_obj = None
+            if c_id is not None:
+                choice_obj = Choice.objects.filter(id=c_id, question_id=q_id).first()
+                if choice_obj is None:
+                    choice_obj = Choice.objects.filter(id=c_id).first()
+            else:
+                # Text-based choice lookup fallback
+                raw_str = str(selected_choice_id).strip()
+                choice_obj = Choice.objects.filter(question_id=q_id, text__iexact=raw_str).first()
+                if choice_obj:
+                    c_id = choice_obj.id
+
+            if choice_obj is not None:
+                is_correct = bool(choice_obj.is_correct)
+            else:
+                # Fallback to in-memory check if Choice lookup fails
+                is_correct = False
+                for c in (question.get("choices") or []):
+                    c_str_id = str(c.get("id"))
+                    c_str_text = str(c.get("text") or "").strip().lower()
+                    sel_str = str(selected_choice_id).strip().lower()
+                    if c_str_id == str(selected_choice_id) or (sel_str and c_str_text == sel_str):
+                        is_correct = bool(c.get("is_correct"))
+                        try:
+                            c_id = int(c.get("id"))
+                        except Exception:
+                            pass
+                        break
+
+            if c_id is None:
+                return None
 
             participant = Participant.objects.filter(
                 session__code=self.session_code,
@@ -1433,20 +1529,19 @@ class QuizConsumer(AsyncWebsocketConsumer):
             if not participant:
                 return None
 
-            q_id = question["id"]
-            c_id = int(selected_choice_id)
+            from django.db import transaction
+            with transaction.atomic():
+                # Concurrency double check inside transaction to prevent duplicate AnswerRecord (BUG-02)
+                if AnswerRecord.objects.filter(participant=participant, question_id=q_id).exists():
+                    return None
 
-            record, created = AnswerRecord.objects.get_or_create(
-                participant=participant,
-                question_id=q_id,
-                defaults={
-                    "choice_id": c_id,
-                    "correct": is_correct,
-                    "response_time_ms": rt,
-                }
-            )
-            if not created:
-                return None
+                record = AnswerRecord.objects.create(
+                    participant=participant,
+                    question_id=q_id,
+                    choice_id=c_id,
+                    correct=is_correct,
+                    response_time_ms=rt,
+                )
 
             # SCORE
             if is_correct:

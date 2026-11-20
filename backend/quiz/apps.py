@@ -36,7 +36,20 @@ class QuizConfig(AppConfig):
     def ready(self):
         post_migrate.connect(create_default_groups, sender=self)
 
-        # Guard Django's update_last_login signal to avoid pk=None update with djongo
+        # Enable SQLite WAL mode and busy timeout for high-concurrency multiplayer stability
+        try:
+            from django.db.backends.signals import connection_created
+            def configure_sqlite_wal(sender, connection, **kwargs):
+                if connection.vendor == 'sqlite':
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute('PRAGMA journal_mode=WAL;')
+                        cursor.execute('PRAGMA synchronous=NORMAL;')
+                    except Exception:
+                        pass
+            connection_created.connect(configure_sqlite_wal)
+        except Exception:
+            pass
         try:
             from django.contrib.auth.signals import user_logged_in
             from django.contrib.auth.models import update_last_login
